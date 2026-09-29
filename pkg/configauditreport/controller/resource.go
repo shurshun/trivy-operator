@@ -2,10 +2,8 @@ package controller
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"path"
 	"strings"
 	"time"
 
@@ -31,6 +29,7 @@ import (
 	"github.com/aquasecurity/trivy-operator/pkg/operator/workload"
 	"github.com/aquasecurity/trivy-operator/pkg/policy"
 	"github.com/aquasecurity/trivy-operator/pkg/rbacassessment"
+	"github.com/aquasecurity/trivy-operator/pkg/reportstorage"
 	"github.com/aquasecurity/trivy-operator/pkg/trivyoperator"
 	"github.com/aquasecurity/trivy/pkg/iac/scan"
 )
@@ -53,6 +52,7 @@ type ResourceController struct {
 	ClusterVersion   string
 	CacheSyncTimeout time.Duration
 	ChecksLoader     *ChecksLoader
+	ReportStore      reportstorage.Store
 }
 
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
@@ -242,10 +242,10 @@ func (r *ResourceController) reconcileResource(resourceKind kube.Kind) reconcile
 			return ctrl.Result{}, fmt.Errorf("evaluating resource: %w", err)
 		}
 		kind := resource.GetObjectKind().GroupVersionKind().Kind
-		if r.Config.AltReportStorageEnabled && r.Config.AltReportDir != "" {
+		if r.Config.AltReportStorageActive() {
 			// Write reports to alternate storage if enabled
-			log.V(1).Info("Writing config, infra and rbac reports to alternate storage", "dir", r.Config.AltReportDir)
-			return r.writeAlternateReports(resource, misConfigData, log)
+			log.V(1).Info("Writing config, infra and rbac reports to alternate storage")
+			return r.writeAlternateReports(ctx, resource, misConfigData, log)
 		}
 		// create config-audit report
 		if !kube.IsRoleTypes(kube.Kind(kind)) || r.MergeRbacFindingWithConfigAudit {
@@ -299,68 +299,22 @@ func (r *ResourceController) reconcileResource(resourceKind kube.Kind) reconcile
 	}
 }
 
-func (r *ResourceController) writeAlternateReports(resource client.Object, misConfigData Misconfiguration, log logr.Logger) (ctrl.Result, error) {
-	// Write reports to alternate storage if enabled
-	if r.Config.AltReportStorageEnabled && r.Config.AltReportDir != "" {
-		// Get the report directory from the environment variable
-		reportDir := r.Config.AltReportDir
-		// Create subdirectories for each type of report
-		configAuditDir := filepath.Join(reportDir, "config_audit_reports")
-		rbacAssessmentDir := filepath.Join(reportDir, "rbac_assessment_reports")
-		infraAssessmentDir := filepath.Join(reportDir, "infra_assessment_reports")
-
-		// Ensure the directories exist
-		if err := os.MkdirAll(configAuditDir, 0o750); err != nil {
-			log.Error(err, "Failed to create configAuditDir")
+func (r *ResourceController) writeAlternateReports(ctx context.Context, resource client.Object, misConfigData Misconfiguration, log logr.Logger) (ctrl.Result, error) {
+	fileName := fmt.Sprintf("%s-%s.json", resource.GetObjectKind().GroupVersionKind().Kind, resource.GetName())
+	reports := []struct {
+		key  string
+		name string
+		data any
+	}{
+		{path.Join("config_audit_reports", fileName), "Config audit", misConfigData.configAuditReportData},
+		{path.Join("infra_assessment_reports", fileName), "Infra assessment", misConfigData.infraAssessmentReportData},
+		{path.Join("rbac_assessment_reports", fileName), "RBAC assessment", misConfigData.rbacAssessmentReportData},
+	}
+	for _, report := range reports {
+		if err := r.ReportStore.Put(ctx, report.key, report.data); err != nil {
 			return ctrl.Result{}, err
 		}
-		if err := os.MkdirAll(rbacAssessmentDir, 0o750); err != nil {
-			log.Error(err, "Failed to create rbacAssessmentDir")
-			return ctrl.Result{}, err
-		}
-		if err := os.MkdirAll(infraAssessmentDir, 0o750); err != nil {
-			log.Error(err, "Failed to create infraAssessmentDir")
-			return ctrl.Result{}, err
-		}
-		// Extract workload kind and name from resource labels
-		workloadKind := resource.GetObjectKind().GroupVersionKind().Kind
-		workloadName := resource.GetName()
-
-		// Write config audit report to a file
-		configReportData, err := json.Marshal(misConfigData.configAuditReportData)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		configReportPath := filepath.Join(configAuditDir, fmt.Sprintf("%s-%s.json", workloadKind, workloadName))
-		err = os.WriteFile(configReportPath, configReportData, 0o600)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		log.Info("Config audit report written", "path", configReportPath)
-
-		// Write infra assessment report to a file
-		infraReportData, err := json.Marshal(misConfigData.infraAssessmentReportData)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		infraReportPath := filepath.Join(infraAssessmentDir, fmt.Sprintf("%s-%s.json", workloadKind, workloadName))
-		err = os.WriteFile(infraReportPath, infraReportData, 0o600)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		log.Info("Infra assessment report written", "path", infraReportPath)
-
-		// Write RBAC assessment report to a file
-		rbacReportData, err := json.Marshal(misConfigData.rbacAssessmentReportData)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		rbacReportPath := filepath.Join(rbacAssessmentDir, fmt.Sprintf("%s-%s.json", workloadKind, workloadName))
-		err = os.WriteFile(rbacReportPath, rbacReportData, 0o600)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		log.Info("RBAC assessment report written", "path", rbacReportPath)
+		log.Info(report.name+" report written", "key", report.key)
 	}
 	return ctrl.Result{}, nil
 }
