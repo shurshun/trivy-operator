@@ -1,4 +1,5 @@
-# Builds the feat/alt-report-storage-s3 branch and pushes a multi-arch image to GHCR.
+# Builds the feat/alt-report-storage-s3 branch and pushes a multi-arch image and the Helm chart to GHCR.
+# The chart defaults to the image built in the same run.
 # Re-run the workflow to rebuild from the latest commit of that branch.
 name: GHCR image
 
@@ -12,6 +13,7 @@ permissions: {}
 env:
   SOURCE_REF: feat/alt-report-storage-s3
   IMAGE: ghcr.io/${{ github.repository_owner }}/trivy-operator
+  CHARTS: oci://ghcr.io/${{ github.repository_owner }}/charts
 
 jobs:
   image:
@@ -69,3 +71,16 @@ jobs:
             --tag "${IMAGE}:s3-${sha}" \
             --push
           echo "Pushed ${IMAGE}:s3 and ${IMAGE}:s3-${sha}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package and push chart
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha="$(git rev-parse --short HEAD)"
+          version="$(yq '.version' deploy/helm/Chart.yaml)-s3-${sha}"
+          yq -i ".image.registry = \"ghcr.io\" | .image.repository = \"${GITHUB_REPOSITORY_OWNER}/trivy-operator\" | .image.tag = \"s3-${sha}\"" \
+            deploy/helm/values.yaml
+          helm package deploy/helm --version "$version" --destination dist
+          echo "$GITHUB_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          helm push "dist/trivy-operator-${version}.tgz" "$CHARTS"
+          echo "Pushed chart ${CHARTS}/trivy-operator:${version}" >> "$GITHUB_STEP_SUMMARY"
